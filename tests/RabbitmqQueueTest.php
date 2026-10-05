@@ -930,7 +930,8 @@ test(
         $envelope = createRabbitmqTestEnvelope();
         $job = new TestJob('terminate test');
         $job->setId('terminate-job-id');
-        $maxAttempts = $job->maxAttempts;
+        // TestJob sets no maxAttempts, so the shipped queue.max_attempts default (3) applies
+        $maxAttempts = 3;
 
         // Simulate maxAttempts releases
         for ($i = 0; $i < $maxAttempts; $i++) {
