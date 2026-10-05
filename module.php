@@ -28,6 +28,9 @@ return [
         FailedJobRepositoryInterface::class => RabbitmqFailedJobRepository::class,
         RabbitmqConnection::class => static function (ContainerInterface $container): RabbitmqConnection {
             $config = $container->get(ConfigRepositoryInterface::class);
+            // An app config that sets tls to null removes the key (ConfigMerger
+            // unsets null overrides), so a missing key also means plain TCP.
+            $tls = $config->has(key: 'queue-rabbitmq.tls') ? $config->get(key: 'queue-rabbitmq.tls') : null;
 
             return new RabbitmqConnection(
                 host: $config->getString(key: 'queue-rabbitmq.host'),
@@ -35,9 +38,7 @@ return [
                 user: $config->getString(key: 'queue-rabbitmq.user'),
                 password: $config->getString(key: 'queue-rabbitmq.password'),
                 vhost: $config->getString(key: 'queue-rabbitmq.vhost'),
-                tlsOptions: $config->get(key: 'queue-rabbitmq.tls') === null
-                    ? null
-                    : $config->getArray(key: 'queue-rabbitmq.tls'),
+                tlsOptions: $tls === null ? null : $config->getArray(key: 'queue-rabbitmq.tls'),
             );
         },
         ExchangeConfig::class => static function (ContainerInterface $container): ExchangeConfig {

@@ -17,12 +17,13 @@ use ReflectionProperty;
 
 /**
  * @param array<string, mixed> $overrides
+ * @param list<string> $without Config keys to leave out
  */
 function createRabbitmqContainer(
     array $overrides = [],
+    array $without = [],
 ): Container {
-    $container = new Container();
-    $container->instance(ConfigRepositoryInterface::class, new FakeConfigRepository([
+    $config = [
         'queue.queue' => 'emails',
         'encryption.key' => 'test-key',
         'queue-rabbitmq.host' => 'rabbit.internal',
@@ -36,7 +37,14 @@ function createRabbitmqContainer(
         'queue-rabbitmq.exchange.durable' => false,
         'queue-rabbitmq.exchange.auto_delete' => true,
         ...$overrides,
-    ]));
+    ];
+
+    foreach ($without as $key) {
+        unset($config[$key]);
+    }
+
+    $container = new Container();
+    $container->instance(ConfigRepositoryInterface::class, new FakeConfigRepository($config));
 
     $modules = [
         require dirname(__DIR__, 2) . '/queue/module.php',
@@ -84,6 +92,12 @@ describe('queue-rabbitmq module bindings', function (): void {
 
     it('passes a null tls config through as no TLS options', function (): void {
         $connection = createRabbitmqContainer(['queue-rabbitmq.tls' => null])->get(RabbitmqConnection::class);
+
+        expect($connection->tlsOptions)->toBeNull();
+    });
+
+    it('treats a tls key removed by a null app override as no TLS options', function (): void {
+        $connection = createRabbitmqContainer(without: ['queue-rabbitmq.tls'])->get(RabbitmqConnection::class);
 
         expect($connection->tlsOptions)->toBeNull();
     });
