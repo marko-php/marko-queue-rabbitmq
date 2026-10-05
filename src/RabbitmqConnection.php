@@ -5,9 +5,11 @@ declare(strict_types=1);
 namespace Marko\Queue\Rabbitmq;
 
 use Exception;
+use Marko\Queue\Rabbitmq\Exceptions\RabbitmqException;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Connection\AbstractConnection;
 use PhpAmqpLib\Connection\AMQPStreamConnection;
+use PhpAmqpLib\Exception\AMQPExceptionInterface;
 
 class RabbitmqConnection
 {
@@ -28,12 +30,17 @@ class RabbitmqConnection
     ) {}
 
     /**
-     * @throws Exception
+     * @throws RabbitmqException|Exception
      */
     public function channel(): AMQPChannel
     {
         if ($this->channel === null) {
-            $this->connection = $this->createConnection();
+            try {
+                $this->connection = $this->createConnection();
+            } catch (AMQPExceptionInterface $e) {
+                throw RabbitmqException::connectionFailed($this->host, $this->port, $e);
+            }
+
             $this->channel = $this->connection->channel();
         }
 

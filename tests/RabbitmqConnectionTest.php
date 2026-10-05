@@ -4,9 +4,11 @@ declare(strict_types=1);
 
 namespace Marko\Queue\Rabbitmq\Tests;
 
+use Marko\Queue\Rabbitmq\Exceptions\RabbitmqException;
 use Marko\Queue\Rabbitmq\RabbitmqConnection;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Connection\AbstractConnection;
+use PhpAmqpLib\Exception\AMQPIOException;
 
 function createMockAmqpConnection(): AbstractConnection
 {
@@ -37,6 +39,32 @@ function createMockAmqpConnection(): AbstractConnection
         }
     };
 }
+
+it('throws RabbitmqException naming host, port and config file when the connection is refused', function (): void {
+    $connection = new class () extends RabbitmqConnection
+    {
+        public function __construct()
+        {
+            parent::__construct(host: 'rabbit.internal', port: 5671);
+        }
+
+        protected function createConnection(): AbstractConnection
+        {
+            throw new AMQPIOException('stream_socket_client(): Unable to connect (Connection refused)', 111);
+        }
+    };
+
+    try {
+        $connection->channel();
+        $this->fail('Expected RabbitmqException');
+    } catch (RabbitmqException $e) {
+        expect($e->getMessage())->toContain('rabbit.internal:5671')
+            ->and($e->getSuggestion())->toContain('config/queue-rabbitmq.php')
+            ->and($e->getSuggestion())->toContain('RABBITMQ_HOST')
+            ->and($e->getPrevious())->toBeInstanceOf(AMQPIOException::class)
+            ->and($connection->isConnected())->toBeFalse();
+    }
+});
 
 function createTestableConnection(
     ?AbstractConnection $mockAmqpConnection = null,

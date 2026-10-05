@@ -5,9 +5,8 @@ declare(strict_types=1);
 use Marko\Queue\FailedJobRepositoryInterface;
 use Marko\Queue\QueueInterface;
 use Marko\Queue\Rabbitmq\RabbitmqFailedJobRepository;
-use Marko\Queue\Rabbitmq\RabbitmqQueue;
 
-test('it binds QueueInterface to RabbitmqQueue', function (): void {
+test('it binds QueueInterface through a factory closure', function (): void {
     $modulePath = dirname(__DIR__) . '/module.php';
 
     expect(file_exists($modulePath))->toBeTrue();
@@ -15,7 +14,7 @@ test('it binds QueueInterface to RabbitmqQueue', function (): void {
     $module = require $modulePath;
 
     expect($module['bindings'])->toHaveKey(QueueInterface::class)
-        ->and($module['bindings'][QueueInterface::class])->toBe(RabbitmqQueue::class);
+        ->and($module['bindings'][QueueInterface::class])->toBeInstanceOf(Closure::class);
 });
 
 test('it binds FailedJobRepositoryInterface to RabbitmqFailedJobRepository', function (): void {

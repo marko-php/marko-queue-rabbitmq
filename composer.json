@@ -6,11 +6,13 @@
     "require": {
         "php": "^8.5",
         "marko/core": "self.version",
+        "marko/config": "self.version",
         "marko/queue": "self.version",
         "php-amqplib/php-amqplib": "^3.0"
     },
     "require-dev": {
-        "pestphp/pest": "^4.0"
+        "pestphp/pest": "^4.0",
+        "marko/testing": "self.version"
     },
     "autoload": {
         "psr-4": {
