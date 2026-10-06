@@ -13,6 +13,14 @@ use Marko\Queue\FailedJobRepositoryInterface;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Message\AMQPMessage;
 
+/**
+ * Stores failed jobs as messages on the failed_jobs queue.
+ *
+ * Reads drain the queue without acknowledging anything, then hand every message back with
+ * basic_nack(requeue: true), and delete() acks only the matching message. A message is never
+ * acked before the read is done with it, so an error partway through, or a crash, leaves every
+ * failed job on the queue: the broker requeues unacked messages when the channel closes.
+ */
 readonly class RabbitmqFailedJobRepository implements FailedJobRepositoryInterface
 {
     private const string QUEUE_NAME = 'failed_jobs';
@@ -43,7 +51,14 @@ readonly class RabbitmqFailedJobRepository implements FailedJobRepositoryInterfa
             'failedAt' => $failedJob->failedAt->format('c'),
         ], JSON_THROW_ON_ERROR);
 
-        $this->publishPersistent($channel, $body, $failedJob->id);
+        $channel->basic_publish(
+            new AMQPMessage($body, [
+                'delivery_mode' => AMQPMessage::DELIVERY_MODE_PERSISTENT,
+                'message_id' => $failedJob->id,
+            ]),
+            '',
+            self::QUEUE_NAME,
+        );
     }
 
     /**
@@ -55,14 +70,12 @@ readonly class RabbitmqFailedJobRepository implements FailedJobRepositoryInterfa
     {
         $channel = $this->connection->channel();
         $drained = $this->drain($channel);
-        $failedJobs = [];
 
-        foreach ($drained as $message) {
-            $failedJobs[] = $this->deserializeMessage($message);
-            $this->republish($channel, $message);
+        try {
+            return array_map($this->deserializeMessage(...), $drained);
+        } finally {
+            $this->requeue($channel, $drained);
         }
-
-        return $failedJobs;
     }
 
     /**
@@ -73,17 +86,18 @@ readonly class RabbitmqFailedJobRepository implements FailedJobRepositoryInterfa
     ): ?FailedJob {
         $channel = $this->connection->channel();
         $drained = $this->drain($channel);
-        $found = null;
 
-        foreach ($drained as $message) {
-            if ($message->get('message_id') === $id) {
-                $found = $this->deserializeMessage($message);
+        try {
+            foreach ($drained as $message) {
+                if ($message->get('message_id') === $id) {
+                    return $this->deserializeMessage($message);
+                }
             }
 
-            $this->republish($channel, $message);
+            return null;
+        } finally {
+            $this->requeue($channel, $drained);
         }
-
-        return $found;
     }
 
     /**
@@ -93,18 +107,26 @@ readonly class RabbitmqFailedJobRepository implements FailedJobRepositoryInterfa
         string $id,
     ): bool {
         $channel = $this->connection->channel();
-        $drained = $this->drain($channel);
-        $found = false;
+        $matched = [];
+        $kept = [];
 
-        foreach ($drained as $message) {
+        foreach ($this->drain($channel) as $message) {
             if ($message->get('message_id') === $id) {
-                $found = true;
+                $matched[] = $message;
             } else {
-                $this->republish($channel, $message);
+                $kept[] = $message;
             }
         }
 
-        return $found;
+        try {
+            foreach ($matched as $message) {
+                $channel->basic_ack($message->getDeliveryTag());
+            }
+        } finally {
+            $this->requeue($channel, $kept);
+        }
+
+        return $matched !== [];
     }
 
     /**
@@ -130,55 +152,41 @@ readonly class RabbitmqFailedJobRepository implements FailedJobRepositoryInterfa
     }
 
     /**
-     * Drain all messages from the queue with basic_ack, returning them for processing.
-     * This avoids infinite nack-requeue loops on the real broker.
+     * Fetch every message on the queue without acknowledging any of them.
+     *
+     * The broker does not hand an unacked message out again while this channel holds it, so the
+     * loop ends once the queue is empty. Every drained message must be acked or requeued afterwards.
      *
      * @return list<AMQPMessage>
      *
      * @throws Exception
      */
-    private function drain(AMQPChannel $channel): array
-    {
+    private function drain(
+        AMQPChannel $channel,
+    ): array {
         $messages = [];
 
-        while ($message = $channel->basic_get(self::QUEUE_NAME)) {
+        while (($message = $channel->basic_get(self::QUEUE_NAME)) !== null) {
             $messages[] = $message;
-            $channel->basic_ack($message->getDeliveryTag());
         }
 
         return $messages;
     }
 
     /**
-     * Re-publish a drained message back to the failed jobs queue (restore it).
+     * Hand drained messages back to the queue unchanged.
+     *
+     * @param list<AMQPMessage> $messages
      *
      * @throws Exception
      */
-    private function republish(
+    private function requeue(
         AMQPChannel $channel,
-        AMQPMessage $message,
+        array $messages,
     ): void {
-        $this->publishPersistent($channel, $message->getBody(), $message->get('message_id'));
-    }
-
-    /**
-     * Publish a persistent message to the failed jobs queue.
-     *
-     * @throws Exception
-     */
-    private function publishPersistent(
-        AMQPChannel $channel,
-        string $body,
-        string $messageId,
-    ): void {
-        $channel->basic_publish(
-            new AMQPMessage($body, [
-                'delivery_mode' => AMQPMessage::DELIVERY_MODE_PERSISTENT,
-                'message_id' => $messageId,
-            ]),
-            '',
-            self::QUEUE_NAME,
-        );
+        foreach ($messages as $message) {
+            $channel->basic_nack($message->getDeliveryTag(), requeue: true);
+        }
     }
 
     /**
