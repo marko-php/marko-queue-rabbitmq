@@ -19,6 +19,8 @@ class RabbitmqConnection
 
     /**
      * @param array<string, mixed>|null $tlsOptions
+     *
+     * @throws RabbitmqException
      */
     public function __construct(
         public readonly string $host = 'localhost',
@@ -27,7 +29,33 @@ class RabbitmqConnection
         public readonly string $password = 'guest',
         public readonly string $vhost = '/',
         public readonly ?array $tlsOptions = null,
-    ) {}
+    ) {
+        // guest/guest is public knowledge. RabbitMQ itself only accepts it from loopback by default, so a
+        // remote broker that accepts it has had that protection switched off.
+        if ($user === 'guest' && $password === 'guest' && !self::isLoopbackHost($host)) {
+            throw RabbitmqException::defaultCredentialsOnRemoteHost($host);
+        }
+    }
+
+    /**
+     * Whether the host names this machine: localhost, an address in 127.0.0.0/8, or ::1.
+     */
+    private static function isLoopbackHost(
+        string $host,
+    ): bool {
+        $host = strtolower(trim($host, '[]'));
+
+        if ($host === 'localhost') {
+            return true;
+        }
+
+        if (filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false) {
+            return str_starts_with($host, '127.');
+        }
+
+        return filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false
+            && inet_pton($host) === inet_pton('::1');
+    }
 
     /**
      * @throws RabbitmqException|Exception

@@ -22,6 +22,16 @@ class RabbitmqException extends QueueException
         );
     }
 
+    public static function defaultCredentialsOnRemoteHost(
+        string $host,
+    ): self {
+        return new self(
+            message: "Refusing to connect to RabbitMQ at '$host' with the default guest/guest credentials.",
+            context: 'Creating the AMQP connection for marko/queue-rabbitmq. guest/guest is only accepted for a loopback host (localhost, 127.0.0.1, ::1).',
+            suggestion: 'Create a dedicated RabbitMQ user for this application and set RABBITMQ_USER and RABBITMQ_PASSWORD (or user and password in config/queue-rabbitmq.php). Enable TLS with the tls option when the broker is reached over a network.',
+        );
+    }
+
     /**
      * @param list<string> $validTypes
      */

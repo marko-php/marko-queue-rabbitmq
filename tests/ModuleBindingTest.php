@@ -102,6 +102,26 @@ describe('queue-rabbitmq module bindings', function (): void {
         expect($connection->tlsOptions)->toBeNull();
     });
 
+    it('refuses the shipped guest/guest credentials when the host is not loopback', function (): void {
+        $container = createRabbitmqContainer([
+            'queue-rabbitmq.user' => 'guest',
+            'queue-rabbitmq.password' => 'guest',
+        ]);
+
+        expect(fn () => $container->get(RabbitmqConnection::class))
+            ->toThrow(RabbitmqException::class, "Refusing to connect to RabbitMQ at 'rabbit.internal'");
+    });
+
+    it('accepts the shipped guest/guest credentials for the default localhost', function (): void {
+        $connection = createRabbitmqContainer([
+            'queue-rabbitmq.host' => 'localhost',
+            'queue-rabbitmq.user' => 'guest',
+            'queue-rabbitmq.password' => 'guest',
+        ])->get(RabbitmqConnection::class);
+
+        expect($connection->user)->toBe('guest');
+    });
+
     it('resolves the same RabbitmqConnection instance twice', function (): void {
         $container = createRabbitmqContainer();
 

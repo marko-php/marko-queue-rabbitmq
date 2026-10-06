@@ -45,7 +45,7 @@ it('throws RabbitmqException naming host, port and config file when the connecti
     {
         public function __construct()
         {
-            parent::__construct(host: 'rabbit.internal', port: 5671);
+            parent::__construct(host: 'rabbit.internal', port: 5671, user: 'app', password: 'secret');
         }
 
         protected function createConnection(): AbstractConnection
@@ -113,6 +113,34 @@ describe('RabbitmqConnection', function (): void {
             ->and($connection->user)->toBe('admin')
             ->and($connection->password)->toBe('secret')
             ->and($connection->vhost)->toBe('/production');
+    });
+
+    it('refuses the default guest/guest credentials for a non-loopback host', function (string $host): void {
+        expect(fn () => new RabbitmqConnection(host: $host))
+            ->toThrow(RabbitmqException::class, "Refusing to connect to RabbitMQ at '$host'");
+    })->with(['rabbitmq.example.com', 'rabbitmq', '10.0.0.5', '2001:db8::1', '127.example.com']);
+
+    it('suggests a dedicated user when refusing guest/guest', function (): void {
+        try {
+            new RabbitmqConnection(host: 'rabbitmq.example.com', user: 'guest', password: 'guest');
+            $this->fail('Expected RabbitmqException');
+        } catch (RabbitmqException $e) {
+            expect($e->getSuggestion())->toContain('RABBITMQ_USER')
+                ->and($e->getSuggestion())->toContain('RABBITMQ_PASSWORD');
+        }
+    });
+
+    it('allows the default guest/guest credentials for a loopback host', function (string $host): void {
+        $connection = new RabbitmqConnection(host: $host);
+
+        expect($connection->host)->toBe($host)
+            ->and($connection->user)->toBe('guest');
+    })->with(['localhost', 'LOCALHOST', '127.0.0.1', '127.1.2.3', '::1', '[::1]', '0:0:0:0:0:0:0:1']);
+
+    it('allows guest with a non-default password on a non-loopback host', function (): void {
+        $connection = new RabbitmqConnection(host: 'rabbitmq.example.com', user: 'guest', password: 'rotated');
+
+        expect($connection->host)->toBe('rabbitmq.example.com');
     });
 
     it('lazily connects on first channel call', function (): void {
