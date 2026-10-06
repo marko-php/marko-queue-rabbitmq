@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Marko\Queue\Rabbitmq\Tests;
 
 use DateTimeImmutable;
+use JsonException;
 use Marko\Queue\FailedJob;
 use Marko\Queue\FailedJobRepositoryInterface;
 use Marko\Queue\Rabbitmq\RabbitmqConnection;
@@ -12,6 +13,7 @@ use Marko\Queue\Rabbitmq\RabbitmqFailedJobRepository;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Connection\AbstractConnection;
 use PhpAmqpLib\Message\AMQPMessage;
+use RuntimeException;
 
 /** @noinspection PhpMissingParentConstructorInspection - Test stub intentionally skips parent */
 class MockFailedJobChannel extends AMQPChannel
@@ -29,13 +31,44 @@ class MockFailedJobChannel extends AMQPChannel
 
     public int $passiveDeclareCount = 0;
 
-    /** @var list<array{body: string, message_id: string, delivery_tag: int}> */
+    /**
+     * Ready messages, in queue order, like a broker queue.
+     *
+     * @var list<array{body: string, message_id: ?string, seq: int}>
+     */
     public array $queuedMessages = [];
 
-    private int $getIndex = 0;
+    /**
+     * Messages handed out by basic_get() and not yet acked or nacked, keyed by delivery tag.
+     *
+     * @var array<int, array{body: string, message_id: ?string, seq: int}>
+     */
+    public array $unackedMessages = [];
+
+    private int $nextDeliveryTag = 1;
+
+    private int $nextSeq = 1;
 
     /** @noinspection PhpMissingParentConstructorInspection */
     public function __construct() {}
+
+    /**
+     * Put a message on the queue without recording it as published, e.g. a corrupt one.
+     */
+    public function enqueue(
+        string $body,
+        ?string $messageId,
+    ): void {
+        $this->queuedMessages[] = ['body' => $body, 'message_id' => $messageId, 'seq' => $this->nextSeq++];
+    }
+
+    /**
+     * @return list<?string>
+     */
+    public function queuedMessageIds(): array
+    {
+        return array_column($this->queuedMessages, 'message_id');
+    }
 
     public function queue_declare(
         $queue = '',
@@ -67,11 +100,7 @@ class MockFailedJobChannel extends AMQPChannel
             'properties' => $msg->get_properties(),
         ];
 
-        $this->queuedMessages[] = [
-            'body' => $msg->getBody(),
-            'message_id' => $msg->get('message_id'),
-            'delivery_tag' => count($this->queuedMessages) + 1,
-        ];
+        $this->enqueue($msg->getBody(), $msg->get('message_id'));
     }
 
     public function basic_get(
@@ -79,20 +108,20 @@ class MockFailedJobChannel extends AMQPChannel
         $no_ack = false,
         $ticket = null,
     ): ?AMQPMessage {
-        if ($this->getIndex >= count($this->queuedMessages)) {
-            $this->getIndex = 0;
+        $messageData = array_shift($this->queuedMessages);
 
+        if ($messageData === null) {
             return null;
         }
 
-        $messageData = $this->queuedMessages[$this->getIndex];
-        $this->getIndex++;
+        $deliveryTag = $this->nextDeliveryTag++;
+        $this->unackedMessages[$deliveryTag] = $messageData;
 
         $msg = new AMQPMessage(
             $messageData['body'],
-            ['message_id' => $messageData['message_id']],
+            $messageData['message_id'] === null ? [] : ['message_id' => $messageData['message_id']],
         );
-        $msg->setDeliveryTag($messageData['delivery_tag']);
+        $msg->setDeliveryTag($deliveryTag);
 
         return $msg;
     }
@@ -102,6 +131,7 @@ class MockFailedJobChannel extends AMQPChannel
         $multiple = false,
     ): void {
         $this->ackedTags[] = $delivery_tag;
+        $this->settle($delivery_tag);
     }
 
     public function basic_nack(
@@ -114,6 +144,28 @@ class MockFailedJobChannel extends AMQPChannel
             'multiple' => $multiple,
             'requeue' => $requeue,
         ];
+        $message = $this->settle($delivery_tag);
+
+        if ($requeue) {
+            $this->queuedMessages[] = $message;
+            usort($this->queuedMessages, fn (array $a, array $b): int => $a['seq'] <=> $b['seq']);
+        }
+    }
+
+    /**
+     * @return array{body: string, message_id: ?string, seq: int}
+     */
+    private function settle(
+        int $deliveryTag,
+    ): array {
+        if (!isset($this->unackedMessages[$deliveryTag])) {
+            throw new RuntimeException("PRECONDITION_FAILED - unknown delivery tag $deliveryTag");
+        }
+
+        $message = $this->unackedMessages[$deliveryTag];
+        unset($this->unackedMessages[$deliveryTag]);
+
+        return $message;
     }
 
     public function queue_purge(
@@ -341,9 +393,10 @@ test('it deletes failed job by ID and returns true', function (): void {
 
     $result = $repository->delete('failed-1');
 
-    // Drain-then-restore: all messages acked, then non-deleted ones re-published
+    // Only the deleted message is acked; the other is requeued
     expect($result)->toBeTrue()
-        ->and($channel->ackedTags)->toHaveCount(2);
+        ->and($channel->ackedTags)->toHaveCount(1)
+        ->and($channel->queuedMessageIds())->toBe(['failed-2']);
 });
 
 test('it returns false when deleting non-existent failed job', function (): void {
@@ -363,9 +416,10 @@ test('it returns false when deleting non-existent failed job', function (): void
 
     $result = $repository->delete('non-existent');
 
-    // Non-matching target: all messages acked and re-published (none deleted)
+    // Non-matching target: nothing acked, every message requeued
     expect($result)->toBeFalse()
-        ->and($channel->ackedTags)->toHaveCount(1);
+        ->and($channel->ackedTags)->toBeEmpty()
+        ->and($channel->queuedMessageIds())->toBe(['failed-1']);
 });
 
 test('it clears all failed jobs via queue purge', function (): void {
@@ -455,11 +509,12 @@ it('deletes only the matching failed job and returns true, leaving the others in
 
     // Returns true for found target
     expect($result)->toBeTrue()
-        // Both messages drained and acked
-        ->and($channel->ackedTags)->toHaveCount(2)
-        ->and($channel->nackedTags)->toBeEmpty()
-        // Only the non-matching job is re-published (target is deleted)
-        ->and($channel->publishedMessages)->toHaveCount(3); // 2 store + 1 restore
+        // Only the target is acked; the other is requeued, never republished
+        ->and($channel->ackedTags)->toHaveCount(1)
+        ->and($channel->nackedTags)->toHaveCount(1)
+        ->and($channel->nackedTags[0]['requeue'])->toBeTrue()
+        ->and($channel->publishedMessages)->toHaveCount(2)
+        ->and($channel->queuedMessageIds())->toBe(['del-keep-1']);
 });
 
 it('returns false from delete() when no failed job matches the id', function (): void {
@@ -530,15 +585,15 @@ it('returns the matching failed job from find() by id and terminates', function 
     // Returns correct job
     expect($found)->toBeInstanceOf(FailedJob::class)
         ->and($found->id)->toBe('find-term-2')
-        // Drain-then-restore: all messages acked (not nacked-requeued)
-        ->and($channel->ackedTags)->toHaveCount(2)
-        ->and($channel->nackedTags)->toBeEmpty()
-        // Restore: both messages re-published (find is read-only)
-        ->and($channel->publishedMessages)->toHaveCount(4); // 2 store + 2 restore
+        // find is read-only: nothing acked, both messages requeued in their original order
+        ->and($channel->ackedTags)->toBeEmpty()
+        ->and($channel->nackedTags)->toHaveCount(2)
+        ->and($channel->publishedMessages)->toHaveCount(2)
+        ->and($channel->queuedMessageIds())->toBe(['find-term-1', 'find-term-2']);
 });
 
 it(
-    'returns all stored failed jobs from all() and the call terminates (no infinite basic_get/basic_nack requeue loop)',
+    'returns all stored failed jobs from all() and the call terminates (requeues only after the drain, so no basic_get/basic_nack loop)',
     function (): void {
         $channel = new MockFailedJobChannel();
         $connection = createFailedJobTestConnection($channel);
@@ -566,12 +621,76 @@ it(
 
         // Returns correct jobs
         expect($failedJobs)->toHaveCount(2)
-                ->and($failedJobs[0]->id)->toBe('term-1')
-                ->and($failedJobs[1]->id)->toBe('term-2')
-                // Drain-then-restore: all messages must be acked (consumed), never nacked-requeued
-            ->and($channel->ackedTags)->toHaveCount(2)
-                ->and($channel->nackedTags)->toBeEmpty()
-                // Restore: messages re-published so they are not lost
-            ->and($channel->publishedMessages)->toHaveCount(4); // 2 store + 2 restore
+            ->and($failedJobs[0]->id)->toBe('term-1')
+            ->and($failedJobs[1]->id)->toBe('term-2')
+            // Read-only: nothing acked, every message requeued, nothing republished
+            ->and($channel->ackedTags)->toBeEmpty()
+            ->and($channel->nackedTags)->toHaveCount(2)
+            ->and($channel->publishedMessages)->toHaveCount(2)
+            ->and($channel->queuedMessageIds())->toBe(['term-1', 'term-2']);
     },
 );
+
+function storeFailedJobs(
+    RabbitmqFailedJobRepository $repository,
+    string ...$ids,
+): void {
+    foreach ($ids as $id) {
+        $repository->store(new FailedJob(
+            id: $id,
+            queue: 'default',
+            payload: '{"class":"Job"}',
+            exception: "Error $id",
+            failedAt: new DateTimeImmutable('2024-01-15T10:30:00+00:00'),
+        ));
+    }
+}
+
+describe('message safety', function (): void {
+    it('keeps every failed job on the queue when a message fails to deserialize mid-drain', function (): void {
+        $channel = new MockFailedJobChannel();
+        $repository = new RabbitmqFailedJobRepository(createFailedJobTestConnection($channel));
+        storeFailedJobs($repository, 'before');
+        $channel->enqueue('{not json', 'corrupt');
+        storeFailedJobs($repository, 'after-1', 'after-2');
+
+        expect(fn () => $repository->all())->toThrow(JsonException::class)
+            ->and($channel->ackedTags)->toBeEmpty()
+            ->and($channel->unackedMessages)->toBeEmpty()
+            ->and($channel->queuedMessageIds())->toBe(['before', 'corrupt', 'after-1', 'after-2']);
+    });
+
+    it('keeps every failed job when find() hits a corrupt matching message', function (): void {
+        $channel = new MockFailedJobChannel();
+        $repository = new RabbitmqFailedJobRepository(createFailedJobTestConnection($channel));
+        $channel->enqueue('{not json', 'corrupt');
+        storeFailedJobs($repository, 'other');
+
+        expect(fn () => $repository->find('corrupt'))->toThrow(JsonException::class)
+            ->and($channel->queuedMessageIds())->toBe(['corrupt', 'other']);
+    });
+
+    it('returns the same failed jobs on repeated reads', function (): void {
+        $channel = new MockFailedJobChannel();
+        $repository = new RabbitmqFailedJobRepository(createFailedJobTestConnection($channel));
+        storeFailedJobs($repository, 'a', 'b');
+
+        $first = array_map(fn (FailedJob $job): string => $job->id, $repository->all());
+        $repository->find('a');
+        $second = array_map(fn (FailedJob $job): string => $job->id, $repository->all());
+
+        expect($first)->toBe(['a', 'b'])
+            ->and($second)->toBe(['a', 'b']);
+    });
+
+    it('acks only the deleted message and leaves the rest in order', function (): void {
+        $channel = new MockFailedJobChannel();
+        $repository = new RabbitmqFailedJobRepository(createFailedJobTestConnection($channel));
+        storeFailedJobs($repository, 'a', 'b', 'c');
+
+        expect($repository->delete('b'))->toBeTrue()
+            ->and($channel->queuedMessageIds())->toBe(['a', 'c'])
+            ->and($channel->unackedMessages)->toBeEmpty()
+            ->and($channel->ackedTags)->toHaveCount(1);
+    });
+});

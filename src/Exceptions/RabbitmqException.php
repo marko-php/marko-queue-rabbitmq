@@ -37,4 +37,26 @@ class RabbitmqException extends QueueException
             suggestion: "Set queue-rabbitmq.exchange.type (or RABBITMQ_EXCHANGE_TYPE) to one of: $valid.",
         );
     }
+
+    public static function malformedMessage(
+        string $queue,
+        string $reason,
+    ): self {
+        return new self(
+            message: "Malformed message on RabbitMQ queue '$queue': $reason.",
+            context: 'Reading a message popped from RabbitMQ before handing its job to the worker.',
+            suggestion: 'Publish jobs only through QueueInterface::push() or later(), which set the job_id header and sign the payload.',
+        );
+    }
+
+    public static function republishNotConfirmed(
+        string $jobId,
+        string $queue,
+    ): self {
+        return new self(
+            message: "RabbitMQ did not confirm the retry of job '$jobId' on queue '$queue'.",
+            context: 'Releasing a failed job: the broker nacked the republished copy, so the original message was requeued instead of acknowledged.',
+            suggestion: 'Check the RabbitMQ server logs and resource alarms (disk or memory); the job will be delivered again from its original message.',
+        );
+    }
 }

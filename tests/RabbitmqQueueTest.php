@@ -6,6 +6,7 @@ use Marko\Encryption\Config\EncryptionConfig;
 use Marko\Queue\Exceptions\SerializationException;
 use Marko\Queue\JobEnvelope;
 use Marko\Queue\QueueInterface;
+use Marko\Queue\Rabbitmq\Exceptions\RabbitmqException;
 use Marko\Queue\Rabbitmq\Exchange\ExchangeConfig;
 use Marko\Queue\Rabbitmq\Exchange\ExchangeType;
 use Marko\Queue\Rabbitmq\RabbitmqConnection;
@@ -23,6 +24,18 @@ class MockQueueChannel extends AMQPChannel
     /** @var array<int, array<string, mixed>> */
     public array $calls = [];
 
+    /**
+     * Messages basic_get() hands out one at a time before falling back to $basicGetReturn.
+     *
+     * @var list<AMQPMessage>
+     */
+    public array $basicGetMessages = [];
+
+    /** When true, wait_for_pending_acks() reports the pending publish as nacked by the broker. */
+    public bool $nackPublishes = false;
+
+    private mixed $confirmNackHandler = null;
+
     /** @noinspection PhpMissingParentConstructorInspection */
     public function __construct(
         private readonly ?AMQPMessage $basicGetReturn = null,
@@ -30,6 +43,48 @@ class MockQueueChannel extends AMQPChannel
         private readonly int $queuePurgeCount = 0,
         private readonly bool $passiveDeclareThrows = false,
     ) {}
+
+    public function basic_reject(
+        $delivery_tag,
+        $requeue,
+    ): void {
+        $this->calls[] = [
+            'method' => 'basic_reject',
+            'delivery_tag' => $delivery_tag,
+            'requeue' => $requeue,
+        ];
+    }
+
+    public function confirm_select(
+        $nowait = false,
+    ): null {
+        $this->calls[] = ['method' => 'confirm_select'];
+
+        return null;
+    }
+
+    public function set_ack_handler(
+        $callback,
+    ): void {
+        $this->calls[] = ['method' => 'set_ack_handler'];
+    }
+
+    public function set_nack_handler(
+        $callback,
+    ): void {
+        $this->calls[] = ['method' => 'set_nack_handler'];
+        $this->confirmNackHandler = $callback;
+    }
+
+    public function wait_for_pending_acks(
+        $timeout = 0,
+    ): void {
+        $this->calls[] = ['method' => 'wait_for_pending_acks', 'timeout' => $timeout];
+
+        if ($this->nackPublishes && is_callable($this->confirmNackHandler)) {
+            ($this->confirmNackHandler)(new AMQPMessage(''));
+        }
+    }
 
     public function exchange_declare(
         $exchange,
@@ -121,6 +176,10 @@ class MockQueueChannel extends AMQPChannel
             'method' => 'basic_get',
             'queue' => $queue,
         ];
+
+        if ($this->basicGetMessages !== []) {
+            return array_shift($this->basicGetMessages);
+        }
 
         return $this->basicGetReturn;
     }
@@ -855,28 +914,288 @@ test('it verifies the envelope before unserializing in RabbitmqQueue (pop/consum
         ->and($popped->message)->toBe('verify envelope test');
 });
 
-test('it rejects a tampered RabbitmqQueue payload before unserializing', function (): void {
-    $envelope = createRabbitmqTestEnvelope();
+test('it rejects a tampered RabbitmqQueue payload without unserializing or requeueing it', function (): void {
+    $tamperedPayload = str_repeat('b', 64) . '.O:8:"EvilJob":0:{}';
 
-    $fakeHmac = str_repeat('b', 64);
-    $tamperedPayload = $fakeHmac . '.O:8:"EvilJob":0:{}';
+    $channel = createMockChannel();
+    $channel->basicGetMessages = [rabbitmqMessage($tamperedPayload, ['job_id' => 'tampered-id'], 1)];
+    $queue = createPoisonTestQueue($channel);
 
-    $amqpMessage = new AMQPMessage(
-        $tamperedPayload,
-        ['application_headers' => new AMQPTable(['job_id' => 'tampered-id'])],
+    $popped = null;
+    captureRabbitmqErrorLog(function () use ($queue, &$popped): void {
+        $popped = $queue->pop();
+    });
+
+    expect($popped)->toBeNull()
+        ->and(callsTo($channel, 'basic_reject'))->toBe([
+            ['method' => 'basic_reject', 'delivery_tag' => 1, 'requeue' => false],
+        ])
+        ->and(callsTo($channel, 'basic_ack'))->toBeEmpty();
+});
+
+/**
+ * @param array<string, mixed>|null $headers Null leaves out application_headers entirely
+ */
+function rabbitmqMessage(
+    string $body,
+    ?array $headers,
+    int $deliveryTag,
+): AMQPMessage {
+    $message = new AMQPMessage(
+        $body,
+        $headers === null ? [] : ['application_headers' => new AMQPTable($headers)],
     );
-    $amqpMessage->setDeliveryTag(1);
+    $message->setDeliveryTag($deliveryTag);
 
-    $channel = createMockChannel(basicGetReturn: $amqpMessage);
-    $connection = createTestableRabbitmqConnection($channel);
-    $exchangeConfig = new ExchangeConfig(
-        name: 'test-exchange',
-        type: ExchangeType::Direct,
+    return $message;
+}
+
+function validRabbitmqMessage(
+    string $jobId,
+    int $deliveryTag,
+    string $text = 'valid job',
+): AMQPMessage {
+    $job = new TestJob($text);
+
+    return rabbitmqMessage(
+        createRabbitmqTestEnvelope()->wrap($job->serialize()),
+        ['job_id' => $jobId],
+        $deliveryTag,
+    );
+}
+
+function createPoisonTestQueue(
+    MockQueueChannel $channel,
+    ?JobEnvelope $envelope = null,
+): RabbitmqQueue {
+    return new RabbitmqQueue(
+        createTestableRabbitmqConnection($channel),
+        new ExchangeConfig(name: 'test-exchange', type: ExchangeType::Direct),
+        $envelope ?? createRabbitmqTestEnvelope(),
+    );
+}
+
+/**
+ * @return list<array<string, mixed>>
+ */
+function callsTo(
+    MockQueueChannel $channel,
+    string $method,
+): array {
+    return array_values(array_filter($channel->calls, fn (array $call): bool => $call['method'] === $method));
+}
+
+/**
+ * Point PHP's error log at a temp file for the callback and return what was logged.
+ */
+function captureRabbitmqErrorLog(
+    callable $callback,
+): string {
+    $file = tempnam(sys_get_temp_dir(), 'marko-rabbitmq-log');
+    $previous = ini_set('error_log', $file);
+
+    try {
+        $callback();
+    } finally {
+        ini_set('error_log', (string) $previous);
+    }
+
+    $logged = (string) file_get_contents($file);
+    unlink($file);
+
+    return $logged;
+}
+
+describe('poison messages', function (): void {
+    it('rejects a message with a bad signature and pops the next valid job', function (): void {
+        $channel = createMockChannel();
+        $channel->basicGetMessages = [
+            rabbitmqMessage(str_repeat('a', 64) . '.garbage', ['job_id' => 'bad'], 5),
+            validRabbitmqMessage('good-id', 6, 'after poison'),
+        ];
+        $queue = createPoisonTestQueue($channel);
+
+        $popped = null;
+        captureRabbitmqErrorLog(function () use ($queue, &$popped): void {
+            $popped = $queue->pop();
+        });
+
+        expect($popped)->toBeInstanceOf(TestJob::class)
+            ->and($popped->id)->toBe('good-id')
+            ->and($popped->message)->toBe('after poison')
+            ->and(callsTo($channel, 'basic_reject'))->toBe([
+                ['method' => 'basic_reject', 'delivery_tag' => 5, 'requeue' => false],
+            ]);
+    });
+
+    it('rejects a message signed with a rotated key instead of crashing the worker', function (): void {
+        $oldKeyEnvelope = createRabbitmqTestEnvelope('the-key-before-rotation');
+        $channel = createMockChannel();
+        $channel->basicGetMessages = [
+            rabbitmqMessage($oldKeyEnvelope->wrap((new TestJob('old'))->serialize()), ['job_id' => 'old'], 3),
+        ];
+        $queue = createPoisonTestQueue($channel);
+
+        $popped = 'not popped';
+        captureRabbitmqErrorLog(function () use ($queue, &$popped): void {
+            $popped = $queue->pop();
+        });
+
+        expect($popped)->toBeNull()
+            ->and(callsTo($channel, 'basic_reject'))->toHaveCount(1);
+    });
+
+    it('rejects a message with no application_headers', function (): void {
+        $job = new TestJob('no headers');
+        $channel = createMockChannel();
+        $channel->basicGetMessages = [
+            rabbitmqMessage(createRabbitmqTestEnvelope()->wrap($job->serialize()), null, 8),
+        ];
+        $queue = createPoisonTestQueue($channel);
+
+        $logged = captureRabbitmqErrorLog(fn () => $queue->pop());
+
+        expect(callsTo($channel, 'basic_reject'))->toBe([
+            ['method' => 'basic_reject', 'delivery_tag' => 8, 'requeue' => false],
+        ])
+            ->and($logged)->toContain('no application_headers');
+    });
+
+    it('rejects a message whose job_id header is missing', function (): void {
+        $job = new TestJob('no job id');
+        $channel = createMockChannel();
+        $channel->basicGetMessages = [
+            rabbitmqMessage(createRabbitmqTestEnvelope()->wrap($job->serialize()), ['other' => 'x'], 9),
+        ];
+        $queue = createPoisonTestQueue($channel);
+
+        $logged = captureRabbitmqErrorLog(fn () => $queue->pop());
+
+        expect(callsTo($channel, 'basic_reject'))->toHaveCount(1)
+            ->and($logged)->toContain('job_id header is missing');
+    });
+
+    it('rejects a correctly signed payload that is not a job', function (): void {
+        $channel = createMockChannel();
+        $channel->basicGetMessages = [
+            rabbitmqMessage(createRabbitmqTestEnvelope()->wrap(serialize(['not' => 'a job'])), ['job_id' => 'x'], 4),
+        ];
+        $queue = createPoisonTestQueue($channel);
+
+        $logged = captureRabbitmqErrorLog(fn () => $queue->pop());
+
+        expect(callsTo($channel, 'basic_reject'))->toHaveCount(1)
+            ->and($logged)->toContain('payload is not a serialized');
+    });
+
+    it('logs the queue, delivery tag and reason of a rejected message', function (): void {
+        $channel = createMockChannel();
+        $channel->basicGetMessages = [rabbitmqMessage(str_repeat('c', 64) . '.x', ['job_id' => 'bad'], 12)];
+        $queue = createPoisonTestQueue($channel);
+
+        $logged = captureRabbitmqErrorLog(fn () => $queue->pop('emails'));
+
+        expect($logged)->toContain("Rejected message 12 on queue 'emails' without requeue")
+            ->and($logged)->toContain('HMAC signature does not match');
+    });
+
+    it(
+        'requeues the message and throws when the signing key is empty, rather than dropping every job',
+        function (): void {
+            $channel = createMockChannel();
+            $channel->basicGetMessages = [validRabbitmqMessage('kept', 2)];
+            $queue = createPoisonTestQueue($channel, createRabbitmqTestEnvelope(''));
+
+            expect(fn () => $queue->pop())->toThrow(SerializationException::class, 'encryption key is empty')
+                ->and(callsTo($channel, 'basic_reject'))->toBeEmpty()
+                ->and(callsTo($channel, 'basic_nack'))->toBe([
+                    ['method' => 'basic_nack', 'delivery_tag' => 2, 'multiple' => false, 'requeue' => true],
+                ]);
+        },
+    );
+});
+
+describe('ack safety', function (): void {
+    it(
+        'forgets the payload and queue name of a deleted job so a long-running worker does not leak memory',
+        function (): void {
+            $channel = createMockChannel();
+            $channel->basicGetMessages = [validRabbitmqMessage('done', 1)];
+            $queue = createPoisonTestQueue($channel);
+            $queue->pop();
+
+            $queue->delete('done');
+
+            $tracked = (fn (): array => [$this->deliveryTags, $this->messagePayloads, $this->queueNames])->call(
+                $queue,
+            );
+
+            expect($tracked)->toBe([[], [], []]);
+        },
     );
 
-    $queue = new RabbitmqQueue($connection, $exchangeConfig, $envelope);
+    it('publishes and confirms the retry before acking the original message on release', function (int $delay): void {
+        $channel = createMockChannel();
+        $channel->basicGetMessages = [validRabbitmqMessage('retry', 21)];
+        $queue = createPoisonTestQueue($channel);
+        $queue->pop();
+        $channel->calls = [];
 
-    expect(fn () => $queue->pop())->toThrow(SerializationException::class);
+        $queue->release('retry', $delay);
+
+        $order = array_values(array_filter(
+            array_column($channel->calls, 'method'),
+            fn (string $method): bool => in_array(
+                $method,
+                ['confirm_select', 'basic_publish', 'wait_for_pending_acks', 'basic_ack'],
+                true,
+            ),
+        ));
+
+        expect($order)->toBe(['confirm_select', 'basic_publish', 'wait_for_pending_acks', 'basic_ack'])
+            ->and(callsTo($channel, 'basic_ack')[0]['delivery_tag'])->toBe(21);
+    })->with(['immediate' => 0, 'delayed' => 30]);
+
+    it('puts the channel in confirm mode only once', function (): void {
+        $channel = createMockChannel();
+        $channel->basicGetMessages = [validRabbitmqMessage('one', 1), validRabbitmqMessage('two', 2)];
+        $queue = createPoisonTestQueue($channel);
+
+        $queue->pop();
+        $queue->release('one');
+        $queue->pop();
+        $queue->release('two');
+
+        expect(callsTo($channel, 'confirm_select'))->toHaveCount(1)
+            ->and(callsTo($channel, 'wait_for_pending_acks'))->toHaveCount(2);
+    });
+
+    it('requeues the original instead of acking it when the broker nacks the retry', function (): void {
+        $channel = createMockChannel();
+        $channel->basicGetMessages = [validRabbitmqMessage('nacked', 33)];
+        $channel->nackPublishes = true;
+        $queue = createPoisonTestQueue($channel);
+        $queue->pop();
+
+        expect(fn () => $queue->release('nacked'))
+            ->toThrow(RabbitmqException::class, "RabbitMQ did not confirm the retry of job 'nacked'")
+            ->and(callsTo($channel, 'basic_ack'))->toBeEmpty()
+            ->and(callsTo($channel, 'basic_nack'))->toBe([
+                ['method' => 'basic_nack', 'delivery_tag' => 33, 'multiple' => false, 'requeue' => true],
+            ]);
+    });
+
+    it('forgets a released job', function (): void {
+        $channel = createMockChannel();
+        $channel->basicGetMessages = [validRabbitmqMessage('released', 1)];
+        $queue = createPoisonTestQueue($channel);
+        $queue->pop();
+
+        $queue->release('released');
+
+        expect($queue->release('released'))->toBeFalse()
+            ->and($queue->delete('released'))->toBeFalse();
+    });
 });
 
 test(
